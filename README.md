@@ -62,7 +62,7 @@ Performance across challenging mathematical benchmarks:
 
 ### Insight
 
-**Base model is like an excellent student who has already mastered mathematical and logical reasoning skills, but performs poorly on the test paper, it simply needs to develop good answering habits to achieve outstanding results in exams — in other words, to unlock the capabilities it already possesses.**
+**The powerful base model is like an excellent student who has already mastered mathematical and logical reasoning skills, but performs poorly on the test paper, it simply needs to develop good answering habits to achieve outstanding results in exams — in other words, to unlock the capabilities it already possesses.**
 
 
 <p align="center">
@@ -73,7 +73,7 @@ Performance across challenging mathematical benchmarks:
 </p>
 
 
-During the initial **15** steps of RL training, the model predominantly focuses on learning the format of mathematical solutions. This early phase is crucial, contributing approximately **85%** of the overall performance improvement during the entire RL training process.
+During the initial **15** steps of RL training, the model predominantly focuses on learning the format of mathematical solutions. This early phase is crucial, contributing approximately **85%** of the MATH500 performance improvement during the entire RL training process.
 
 ## Usage
 
