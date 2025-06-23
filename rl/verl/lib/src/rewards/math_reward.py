@@ -373,10 +373,10 @@ class RewardMathFn_xrh(RewardFn):
 
 
         # Correctnes (baseline)
-        score = (soft_format_reward) * 0.5 + ground_truths_reward
+        # score = (soft_format_reward) * 0.5 + ground_truths_reward
 
         # Format-Only
-        score = (soft_format_reward + answer_format_reward) * 0.5
+        # score = (soft_format_reward + answer_format_reward) * 0.5
 
 
         # Format-Length

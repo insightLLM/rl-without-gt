@@ -30,7 +30,7 @@ if [ -z "$MASTER_IP" ]; then
     MASTER_IP=$(python3 ip_utils/get_domain_ip.py $MASTER_ADDR)
 fi
 
-curr_ip=$(python $WORK_DIR/ip_utils/get_host_ip.py)
+curr_ip=$(python3 $WORK_DIR/ip_utils/get_host_ip.py)
 
 echo "master ip:${MASTER_IP}, current ip: ${curr_ip}"
 
