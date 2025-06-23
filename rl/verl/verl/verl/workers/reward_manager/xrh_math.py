@@ -138,3 +138,7 @@ class RewardManagerVal():
             reward_tensor[i, valid_response_length - 1] = score
 
         return reward_tensor
+
+if __name__ == "__main__":
+
+    xrh_math_reward_fn()

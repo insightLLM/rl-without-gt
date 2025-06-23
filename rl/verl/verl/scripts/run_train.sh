@@ -4,8 +4,14 @@ set -x
 DIR=/opt
 cd $DIR
 
-
 #git clone https://github.com/insightLLM/rl-without-gt.git
+
+# 建立目录
+mkdir checkpoints
+
+# 下载模型参数
+# huggingface-cli download --resume-download --repo-type model --local-dir Qwen2.5-Math-7B --local-dir-use-symlinks False Qwen/Qwen2.5-Math-7B
+
 
 # 指定项目名称
 project_name="rl-without-gt"
@@ -32,6 +38,7 @@ pip install wandb aiohttp pylatexenc cyac argparse
 
 # pip install cyac argparse
 
+# 登陆 wandb
 #wandb login <your wandb key>
 
 # 需要安装 ray[default]==2.10 否则无法提交任务
@@ -46,7 +53,7 @@ pip install -e .
 # 训练数据和测试数据的路径
 
 export train_data="/opt/rl-without-gt/rl/verl/lib/data/qwen_template/math_train.parquet"
-#export train_data="/opt/without-GT-RL/rl/verl/lib/data/qwen_template/deepscaler_17k.parquet"
+#export train_data="/opt/rl-without-gt/rl/verl/lib/data/qwen_template/deepscaler_17k.parquet"
 
 export val_data='[/opt/rl-without-gt/rl/verl/lib/data/qwen_template/aime2024.parquet,/opt/rl-without-gt/rl/verl/lib/data/qwen_template/amc2023.parquet,/opt/rl-without-gt/rl/verl/lib/data/qwen_template/math500.parquet]'
 
@@ -55,7 +62,10 @@ export val_data='[/opt/rl-without-gt/rl/verl/lib/data/qwen_template/aime2024.par
 export MASTER_IP=$(hostname -I | awk '{print $1}') # 如果只有一个节点
 export MASTER_PORT=6379
 
-export MODEL_LOAD="/global_data/pretrain/rihui/model_zoo/Qwen2.5-Math-7B"
+
+
+#export MODEL_LOAD="/global_data/pretrain/rihui/model_zoo/Qwen2.5-Math-7B"
+export MODEL_LOAD="/opt/Qwen2.5-Math-7B"
 export CHECKPOINT_LOAD="/opt/checkpoints"
 export CHECKPOINT_SAVE="/opt/checkpoints"
 
