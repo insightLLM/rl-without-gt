@@ -1,10 +1,12 @@
 
-
 import re
-
+import signal
+import time
 import math_evaluation 
 import logging
-from src.rewards.math_utils.utils import _normalize, should_allow_eval, _sympy_parse
+from deepscaler.rewards.math_utils.utils import _normalize, should_allow_eval, _sympy_parse
+# from concurrent.futures import ProcessPoolExecutor, TimeoutError
+from functools import wraps
 
 logging.basicConfig(level=logging.INFO)
 # logging.basicConfig(level=logging.DEBUG)
@@ -12,17 +14,179 @@ logger = logging.getLogger(__name__)
 
 
 
+# 自定义超时异常
+class TimeoutException(Exception):
+    pass
+
+
+def timeout(seconds: float):
+    """
+    超时装饰器：在 seconds 秒后触发 TimeoutException。
+    仅在 Unix (Linux/Mac) 有效，不支持 Windows。
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            # 信号处理器：超时后抛出异常
+            def _handle_timeout(signum, frame):
+                raise TimeoutException(f"Function '{func.__name__}' timed out after {seconds}s")
+
+            # 1. 保存旧的 SIGALRM 处理器，并安装新的
+            old_handler = signal.signal(signal.SIGALRM, _handle_timeout)
+            # 2. 启动定时器（真实时间倒计时，支持小数秒）
+            signal.setitimer(signal.ITIMER_REAL, seconds)
+            try:
+                return func(*args, **kwargs)
+            finally:
+                # 3. 取消定时器，恢复旧的处理器
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, old_handler)
+        return wrapper
+
+    return decorator
+
+# 辅助函数：在子进程中完成 normalize、替换和 sympy 解析
+# def _sympy_worker(text):
+#
+#     # 1. 归一化
+#     normalized = _normalize(text)
+#     # 2. 把单等号替换为双等号
+#     normalized = re.sub(r'(?<!=)=(?!=)', '==', normalized)
+#     # 3. sympy 解析
+#     _ = _sympy_parse(normalized)
+#     # 如果没有抛异常，就返回 True
+#     return True
+
+
+
+class NormalizeAnswer:
+    # ——1—— 常量定义
+    SUBSTITUTIONS = [
+        ('an ', ''), ('a ', ''), ('.$', '$'), ('\\$', ''),
+        (r'\ ', ''), (' ', ''), ('mbox', 'text'),
+        (',\\text{and}', ','), ('\\text{and}', ','),
+        ('\\text{m}', '\\text{}'), ('\\le', '<'),
+    ]
+    REMOVED_EXPRESSIONS = [
+        'square', 'ways', 'integers', 'dollars', 'mph', 'inches', 'ft',
+        'hours', 'km', 'units', '\\ldots', 'sue', 'points', 'feet', 'minutes',
+        'digits', 'cents', 'degrees', 'cm', 'gm', 'pounds', 'meters', 'meals',
+        'edges', 'students', 'childrentickets', 'multiples', '\\text{s}',
+        '\\text{.}', '\\text{\ns}', '\\text{}^2', '\\text{}^3', '\\text{\n}',
+        '\\text{}', r'\mathrm{th}', r'^\circ', r'^{\circ}', r'\;', r',\!',
+        '{,}', '"', '\\dots', '\n', '\r', '\f'
+    ]
+
+    # ——2—— 预编译正则
+    _removed_pat = re.compile('|'.join(re.escape(s) for s in REMOVED_EXPRESSIONS))
+    _sub_map     = {before: after for before, after in SUBSTITUTIONS}
+    _sub_pat     = re.compile('|'.join(re.escape(b) for b in _sub_map))
+
+    _latex_strip_pat = re.compile(
+        r'\\(?:text|textbf|overline)\{(.*?)\}'   # \text{...}, \textbf{...}, \overline{...}
+        r'|\\boxed\{(.*?)\}'                    # \boxed{...}
+        r'|\\\((.*?)\\\)'                       # \( ... \)
+        r'|\\\[(.*?)\\\]'                       # \[ ... \]
+    , re.DOTALL)
+
+    _final_pat  = re.compile(r'finalansweris(.*)')
+    _oxed_pat   = re.compile(r'oxed\{(.*?)\}')
+    _dollar_pat = re.compile(r'\$(.*?)\$')
+
+    _frac_pat = re.compile(r'frac([^{])([^{}])')
+    _sqrt_pat = re.compile(r'sqrt([^{])')
+
+    @timeout(3.0)  # 设置超时 3 秒，可根据需要调整
+    def __normalize_final_answer(self, final_answer: str) -> str:
+
+        # ——1—— 超长输入截断
+        if len(final_answer) > 5000:
+            final_answer = final_answer[-5000:]
+
+        # ——2—— 批量移除和替换
+        final_answer = self._removed_pat.sub('', final_answer)
+        final_answer = self._sub_pat.sub(lambda m: self._sub_map[m.group(0)], final_answer)
+
+        # ——3—— 一次性剥离多种 LaTeX 包裹
+        def _strip_latex(match):
+            for g in match.groups():
+                if g is not None:
+                    return g
+            return ''
+        final_answer = self._latex_strip_pat.sub(_strip_latex, final_answer)
+
+        # ——4—— 定位并保留最后一次关键子串
+        def _last_group(pat, text):
+            last = None
+            for m in pat.finditer(text):
+                last = m.group(1)
+            return last
+
+        last = _last_group(self._final_pat, final_answer)
+        if last is not None:
+            final_answer = last
+        else:
+            last = _last_group(self._oxed_pat, final_answer)
+            if last is not None:
+                final_answer = last
+            else:
+                last = _last_group(self._dollar_pat, final_answer)
+                if last is not None:
+                    final_answer = last
+
+        # ——5—— 清理两端空白
+        final_answer = final_answer.strip()
+
+        # ——6—— 特殊简写替换
+        if 'rac' in final_answer and '\\frac' not in final_answer:
+            final_answer = final_answer.replace('rac', '\\frac')
+
+        # ——7—— 规范 frac / sqrt 简写
+        final_answer = self._frac_pat.sub(r'frac{\1}{\2}', final_answer)
+        final_answer = self._sqrt_pat.sub(r'sqrt{\1}', final_answer)
+
+        # 去除剩余美元符号
+        final_answer = final_answer.replace('$', '')
+
+        # ——8—— 数字逗号清理
+        if final_answer.replace(',', '').isdigit():
+            final_answer = final_answer.replace(',', '')
+
+        return final_answer
+
+    def normalize_final_answer(self, final_answer: str):
+        """
+        调用 __normalize_final_answer，并捕获超时或解析异常。
+        """
+        try:
+            return self.__normalize_final_answer(final_answer)
+
+        except TimeoutException:
+            # 超时：可记录日志或打印警告
+            logger.warning("__normalize_final_answer function timed out, text:{}".format(final_answer))
+            return ''
+
+
 class MATHEvaluator_Base:
 
+    def __init__(self):
 
-    def extract_last_parentheses_content(sefl, text):
+        # 预编译
+        self._re_parens = re.compile(r'\\\((.*?)\\\)', re.DOTALL)
+        # self._re_boxed = re.compile(r'\\boxed\{([^{}]*)\}')
+        self._re_answer = re.compile(r'<answer>(.*?)</answer>', re.DOTALL)
+        self._re_think = re.compile(r'<think>(.*?)</think>', re.DOTALL)
+
+        self.nor_obj = NormalizeAnswer()
+
+    def extract_last_parentheses_content(self, text):
         """
         使用正则表达式查找所有被 \( \) 包围的内容
         """
-        
-        matches = re.findall(r'\\\((.*?)\\\)', text, flags=re.DOTALL)
-        # 返回最后一个匹配的内容，如果存在的话
-        return matches[-1] if matches else None
+        last = None
+        for m in self._re_parens.finditer(text):
+            last = m.group(1)
+        return last
 
 
     def extract_boxed_answer(self, text):
@@ -32,7 +196,8 @@ class MATHEvaluator_Base:
         """
 
         # 找到 \boxed 的起始位置
-        start = text.rfind("\\boxed")
+        start = text.rfind("\\boxed") # 从右边开始找
+
         if start == -1:
             return None  # 如果没有找到 \boxed，则返回 None
 
@@ -59,35 +224,28 @@ class MATHEvaluator_Base:
 
         return None  # 如果没有找到匹配的括号，返回 None
 
+
     def extract_xml_answer(self, text):
         """
         从输入文本 text 中提取 <answer>...</answer> 标签内的内容。
-
         """
-        match=re.search('<answer>(.*)</answer>',text,re.DOTALL)
+        m = self._re_answer.search(text)
+        return m.group(1) if m else None
 
-        if match:
-            answer=match.group(1)
-            return answer
-        
-        else:
-            return None
+
     
     def extract_xml_think(self, text):
         """
         从输入文本 text 中提取 <think>...</think> 标签内的内容。
 
         """
-        match=re.search('<think>(.*)</think>',text,re.DOTALL)
+        m = self._re_think.search(text)
+        return m.group(1).strip() if m else ''
 
-        if match:
-            answer=match.group(1)
-        else:
-            answer=''
 
-        return answer.strip()
-    
-    def val_by_sympy(self, text):
+
+    @timeout(3.0)  # 设置超时 3 秒，可根据需要调整
+    def __val_by_sympy(self, text):
         """
         通过 sympy 校验 数学表达式是否合法
         """
@@ -98,17 +256,52 @@ class MATHEvaluator_Base:
         normalized_text = re.sub(r'(?<!=)=(?!=)', '==', normalized_text)
 
         # if should_allow_eval(normalized_text):
-            
+
         try:
             normalized_text = _sympy_parse(normalized_text)
             # 尝试解析表达式
             # sympy.simplify(normalized_text)
 
             return True
-        
+
         except Exception:
             return False
-        
+
+    def val_by_sympy(self, text: str) -> bool:
+        """
+        调用 __val_by_sympy，并捕获超时或解析异常。
+        """
+        try:
+            return self.__val_by_sympy(text)
+        except TimeoutException:
+            # 超时：可记录日志或打印警告
+            logger.warning("val_by_sympy function timed out, text:{}".format(text))
+            return False
+    
+    # def val_by_sympy(self, text: str, timeout: float = 3.0) -> bool:
+    #     """
+    #     通过 sympy 校验 数学表达式是否合法，并在 `timeout` 秒后超时退出。
+    #
+    #     Args:
+    #         text: 原始的数学表达式字符串
+    #         timeout: 最多等待 Sympy 解析的秒数（默认 3s）
+    #
+    #     Returns:
+    #         True: 解析成功且在超时内
+    #         False: 解析失败或超时
+    #     """
+    #     with ProcessPoolExecutor(max_workers=1) as executor:
+    #         future = executor.submit(_sympy_worker, text)
+    #         try:
+    #             # 等待 worker 返回，超时则抛出 TimeoutError
+    #             return future.result(timeout=timeout)
+    #         except TimeoutError:
+    #             # 超时：取消任务并返回 False
+    #             future.cancel()
+    #             return False
+    #         except Exception:
+    #             # 解析或 normalize 出错
+    #             return False
 
 
     def parse_answer(self, response):
@@ -135,7 +328,7 @@ class MATHEvaluator_Base:
                 if normalize_answer is None:
                     
                     # 再试试这个
-                    normalize_answer = self.normalize_final_answer(pred_answer)
+                    normalize_answer = self.nor_obj.normalize_final_answer(pred_answer)
 
 
         else: # 在 <answer>...</answer> 标签中找不到答案
@@ -163,86 +356,7 @@ class MATHEvaluator_Base:
         else:
             return 0.0
 
-    def normalize_final_answer(self, final_answer: str) -> str:
 
-        SUBSTITUTIONS = [('an ', ''), ('a ', ''), ('.$', '$'), ('\\$', ''),
-                         (r'\ ', ''), (' ', ''), ('mbox', 'text'),
-                         (',\\text{and}', ','), ('\\text{and}', ','),
-                         ('\\text{m}', '\\text{}'), ('\\le', '<')]
-        REMOVED_EXPRESSIONS = [
-            'square', 'ways', 'integers', 'dollars', 'mph', 'inches', 'ft',
-            'hours', 'km', 'units', '\\ldots', 'sue', 'points', 'feet', 'minutes',
-            'digits', 'cents', 'degrees', 'cm', 'gm', 'pounds', 'meters', 'meals',
-            'edges', 'students', 'childrentickets', 'multiples', '\\text{s}',
-            '\\text{.}', '\\text{\ns}', '\\text{}^2', '\\text{}^3', '\\text{\n}',
-            '\\text{}', r'\mathrm{th}', r'^\circ', r'^{\circ}', r'\;', r',\!',
-            '{,}', '"', '\\dots', '\n', '\r', '\f'
-        ]
-
-        """Normalize a final answer to a quantitative reasoning question."""
-        # final_answer = final_answer.split('=')[-1]
-        for before, after in SUBSTITUTIONS:
-            final_answer = final_answer.replace(before, after)
-        for expr in REMOVED_EXPRESSIONS:
-            final_answer = final_answer.replace(expr, '')
-
-        # Extract answer that is in LaTeX math, is bold,
-        # is surrounded by a box, etc.
-
-        final_answer = re.sub(r'(\\text\{)(.*?)(\})', '\\2', final_answer)
-        final_answer = re.sub(r'(\\textbf\{)(.*?)(\})', '\\2', final_answer)
-        final_answer = re.sub(r'(\\overline\{)(.*?)(\})', '\\2', final_answer)
-        final_answer = re.sub(r'(\\boxed\{)(.*)(\})', r'\2', final_answer)
-
-        final_answer = re.sub(r'\\\((.*?)\\\)',  r'\1', final_answer)
-        final_answer = re.sub(r'\\\[(.*?)\\\]',  r'\1', final_answer)
-
-        assert '\n' not in final_answer
-        assert '\r' not in final_answer
-        assert '\f' not in final_answer
-
-        if len(re.findall(r'finalansweris(.*)', final_answer)) > 0:
-            final_answer = re.findall(r'finalansweris(.*)', final_answer)[-1]
-
-        if len(re.findall(r'oxed\{(.*?)\}', final_answer)) > 0:
-            final_answer = re.findall(r'oxed\{(.*?)\}', final_answer)[-1]
-
-        if len(re.findall(r'\$(.*?)\$', final_answer)) > 0:
-            final_answer = re.findall(r'\$(.*?)\$', final_answer)[-1]
-
-        final_answer = final_answer.strip()
-
-        if 'rac' in final_answer and '\\frac' not in final_answer:
-            final_answer = final_answer.replace('rac', '\\frac')
-
-        # Normalize shorthand TeX:
-        # \fracab -> \frac{a}{b}
-        # \frac{abc}{bef} -> \frac{abc}{bef}
-        # \fracabc -> \frac{a}{b}c
-        # \sqrta -> \sqrt{a}
-        # \sqrtab -> sqrt{a}b
-        final_answer = re.sub(r'(frac)([^{])(.)', 'frac{\\2}{\\3}',
-                                final_answer)
-        final_answer = re.sub(r'(sqrt)([^{])', 'sqrt{\\2}', final_answer)
-        final_answer = final_answer.replace('$', '')
-
-        # Normalize 100,000 -> 100000
-        if final_answer.replace(',', '').isdigit():
-            final_answer = final_answer.replace(',', '')
-
-        return final_answer
-        
-    def data_process_for_prediction(self, text):
-        """
-        找出 text 中的含有 final answer 的句子，对其进行标准化
-        """
-        for maybe_ans in text.split('.'):
-            if 'final answer' in maybe_ans.lower():
-                return self.normalize_final_answer(maybe_ans)
-            
-        return text
-        # return normalize_final_answer(
-        #     text.split('Final Answer: ', 1)[-1].split('\n\n')[0])
 
     def _fix_fracs(self, string):
         substrs = string.split('\\frac')
@@ -380,6 +494,7 @@ class MATHEvaluator_Base:
 
         return string
 
+
     def is_equiv(self, str1, str2, verbose=False):
         if str1 is None and str2 is None:
             print('WARNING: Both None')
@@ -398,28 +513,47 @@ class MATHEvaluator_Base:
 
 class MATHEvaluator(MATHEvaluator_Base):
 
-    def is_equiv(self, str1, str2):
+    @timeout(3.0)  # 设置超时 3 秒，可根据需要调整
+    def __is_equiv(self, str1, str2, mode='math_evaluation'):
 
-        # print('use new is_equiv')
-        
-        if str1 is None and str2 is None:
-            print('WARNING: Both None')
-            return True
 
-        if str1 is None or str2 is None:
+        if mode == 'math_evaluation':
+
+            if str1 is None and str2 is None:
+                print('WARNING: Both None')
+                return True
+
+            if str1 is None or str2 is None:
+                return False
+
+            try:
+                ss1 = self._strip_string(str1)
+                ss2 = self._strip_string(str2)
+
+                logger.debug('ss1: {}'.format(ss1))
+                logger.debug('ss2: {}'.format(ss2))
+
+                return math_evaluation.is_equiv(ss1, ss2)
+
+
+            except:  # noqa
+
+                return math_evaluation.is_equiv(str1, str2)
+
+    def is_equiv(self, str1, str2, mode='math_evaluation') -> bool:
+        """
+        调用 __is_equiv，并捕获超时或解析异常。
+        """
+        try:
+            return self.__is_equiv(str1, str2, mode)
+
+        except TimeoutException:
+            # 超时：可记录日志或打印警告
+            logger.warning("__is_equiv function timed out, str1:{}, str2:{}".format(str1, str2))
             return False
 
-        try:
-            ss1 = self._strip_string(str1)
-            ss2 = self._strip_string(str2)
-
-            logger.debug('ss1: {}'.format(ss1))
-            logger.debug('ss2: {}'.format(ss2))
 
 
-            return math_evaluation.is_equiv(ss1, ss2)
-        except:  # noqa
-            return math_evaluation.is_equiv(str1, str2)
 
 
 if __name__ == '__main__':
@@ -483,46 +617,99 @@ if __name__ == '__main__':
     response7_4="\\boxed{16}"
     answer7_4="16.0"
 
-    # print(eval.score(response1_1, answer1_1))
+    response7_5="\\boxed{20.39}"
+    answer7_5="20.39\n"
 
+    response7_6="\\boxed{0.01\n,0.02\n}"
+    answer7_6="0.01\n,0.02\n"
+
+    response7_7="\\boxed{3.64}"
+    answer7_7 = "$3.64$"
+
+    response7_8="\\boxed{yes}"
+    answer7_8 = "Yes"
+
+    # 8.circ
+    response8_1="So, the angle between the two lines is \\(\\boxed{90}\\) degrees."
+    answer8_1="90^\\circ"
+
+
+    # 促发 math_evaluation 的timeout 的 case
+    # print(math_evaluation.is_equiv('512', '5'))
+    # print(math_evaluation.is_equiv('16', '81'))
+
+    # 记录开始时间（秒）
+    start = time.time()
+
+    # print(eval.score(response1_1, answer1_1))
+    #
     # print(eval.score(response2_1, answer2_1))
     # print(eval.score(response2_2, answer2_2))
     # print(eval.score(response2_3, answer2_3))
     # print(eval.score(response2_4, answer2_4))
-
+    #
     # print(eval.score(response3_1, answer3_1))
-
+    #
     # print(eval.score(response4_1, answer4_1))
-
-
+    #
+    #
     # print(eval.score(response5_1, answer5_1))
     # print(eval.score(response5_2, answer5_2))
     # print(eval.score(response5_3, answer5_3))
     # print(eval.score(response5_4, answer5_4))
-
+    #
     # print(eval.score(response6_1, answer6_2))
-
+    #
     # print(eval.score(response7_1, answer7_1))
     # print(eval.score(response7_2, answer7_2))
     # print(eval.score(response7_3, answer7_3))
+    #
     # print(eval.score(response7_4, answer7_4))
 
-    print(eval.val_by_sympy("x"))
+    print(eval.score(response7_5, answer7_5))
 
-    print(eval.val_by_sympy("哈哈哈"))
+    print(eval.score(response7_6, answer7_6))
 
-    print(eval.val_by_sympy("x +* 2"))
+    print(eval.score(response7_7, answer7_7))
+
+    print(eval.score(response7_8, answer7_8))
+
+    # print(eval.score(response8_1, answer8_1))
+
+    # 记录结束时间（秒）
+    end = time.time()
+    print(f"代码运行时间：{end - start:.6f} 秒")
+
+    # 记录开始时间（秒）
+    # start = time.time()
+    #
+    # print(eval.val_by_sympy("x"))
+    # print(eval.val_by_sympy("哈哈哈"))
+    #
+    # print(eval.val_by_sympy("x +* 2"))
     # print(eval.val_by_sympy("x + 2 == 1"))
     # print(eval.val_by_sympy(" x^2 + 12y "))
-    print(eval.val_by_sympy(" x^2 + 12y =1"))
-    print(eval.val_by_sympy("frac{x^2 + 2x + 5}{x-3} "))
-    print(eval.val_by_sympy("frac{x^2 + 2x + 5}{x-3} ==2"))
-    print(eval.val_by_sympy("(0,\\infty)"))
-    print(eval.val_by_sympy("\\frac{3}{2}"))
-    print(eval.val_by_sympy("(0,1 "))
-    print(eval.val_by_sympy(""))
+    # print(eval.val_by_sympy(" x^2 + 12y =1"))
+    # print(eval.val_by_sympy("frac{x^2 + 2x + 5}{x-3} "))
+    # print(eval.val_by_sympy("frac{x^2 + 2x + 5}{x-3} ==2"))
+    # print(eval.val_by_sympy("(0,\\infty)"))
+    # print(eval.val_by_sympy("\\frac{3}{2}"))
+    # print(eval.val_by_sympy("(0,1 "))
+    # print(eval.val_by_sympy(""))
+    #
     # print(eval.val_by_sympy("(3, 4]"))
-
+    # print(eval.val_by_sympy("(3, 4)"))
+    # print(eval.val_by_sympy("[3, 4]"))
+    #
+    #
     # print(eval.val_by_sympy("104.0"))
     # print(eval.val_by_sympy(" 104.0 "))
     # print(eval.val_by_sympy("\\frac{1}{2}"))
+
+    # print(eval.val_by_sympy("90^\\circ"))
+
+    #
+    # # 记录结束时间（秒）
+    # end = time.time()
+    # print(f"代码运行时间：{end - start:.6f} 秒")
+
